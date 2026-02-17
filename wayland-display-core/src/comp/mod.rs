@@ -945,8 +945,11 @@ pub(crate) fn init(
         std::process::Stdio::null(),
         |_| {}, // No user data initialization
     ) {
-        Ok((xwayland, _client)) => {
+        Ok((xwayland, xwayland_client)) => {
             tracing::info!("Xwayland spawned. Waiting for ready event...");
+            // Store client in Arc<Mutex> so we can move it into the closure
+            let client_holder = Arc::new(Mutex::new(Some(xwayland_client)));
+            let client_for_closure = client_holder.clone();
             // Handle Xwayland events
             xwayland_handle
                 .insert_source(xwayland, move |event, _, state| match event {
@@ -955,19 +958,25 @@ pub(crate) fn init(
                         display_number,
                     } => {
                         tracing::info!(display_number, "Xwayland is ready");
-                        // Start the X11 window manager
-                        match X11Wm::start_wm(
-                            state.handle.clone(),
-                            x11_socket,
-                            state.dh.clone(),
-                        ) {
-                            Ok(wm) => {
-                                state.xwm = Some(wm);
-                                tracing::info!("X11 window manager started");
+                        // Take the client out of the holder (can only happen once)
+                        let client = client_for_closure.lock().unwrap().take();
+                        if let Some(client) = client {
+                            // Start the X11 window manager
+                            match X11Wm::start_wm(
+                                state.handle.clone(),
+                                x11_socket,
+                                client,
+                            ) {
+                                Ok(wm) => {
+                                    state.xwm = Some(wm);
+                                    tracing::info!("X11 window manager started");
+                                }
+                                Err(e) => {
+                                    tracing::error!(?e, "Failed to start X11 window manager");
+                                }
                             }
-                            Err(e) => {
-                                tracing::error!(?e, "Failed to start X11 window manager");
-                            }
+                        } else {
+                            tracing::error!("Xwayland client already consumed - this shouldn't happen");
                         }
                     }
                     XWaylandEvent::Error => {

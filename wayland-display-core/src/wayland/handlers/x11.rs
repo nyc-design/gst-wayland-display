@@ -38,7 +38,7 @@ use crate::comp::{FocusTarget, State};
 /// Helper to check if a Window wraps a specific X11Surface
 fn window_matches_x11(window: &Window, x11_surface: &X11Surface) -> bool {
     match window.underlying_surface() {
-        WindowSurface::X11(s) => s == *x11_surface,
+        WindowSurface::X11(s) => *s == *x11_surface,
         WindowSurface::Wayland(_) => false,
     }
 }

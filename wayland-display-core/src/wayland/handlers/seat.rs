@@ -2,7 +2,7 @@ use smithay::{
     delegate_seat,
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     reexports::wayland_server::Resource,
-    wayland::selection::data_device::set_data_device_focus,
+    wayland::{seat::WaylandFocus, selection::data_device::set_data_device_focus},
 };
 
 use crate::comp::{FocusTarget, State};
