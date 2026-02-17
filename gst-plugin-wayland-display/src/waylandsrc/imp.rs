@@ -56,6 +56,19 @@ pub struct Settings {
     /// Name for the secondary interpipesink (e.g. "{session_id}_secondary_video").
     /// When set with multi-output=true, a secondary pipeline is auto-spawned in-process.
     secondary_sink_name: Option<String>,
+    /// Path to a RetroArch-compatible .slangp shader preset for the primary output.
+    #[cfg(feature = "shader")]
+    shader_preset: Option<String>,
+    /// Semicolon-separated parameter overrides for the primary shader.
+    /// Format: "PARAM1=0.5;PARAM2=1.0"
+    #[cfg(feature = "shader")]
+    shader_params: Option<String>,
+    /// Path to a .slangp shader preset for the secondary output.
+    #[cfg(feature = "shader")]
+    secondary_shader_preset: Option<String>,
+    /// Semicolon-separated parameter overrides for the secondary shader.
+    #[cfg(feature = "shader")]
+    secondary_shader_params: Option<String>,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -235,6 +248,30 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .construct()
                     .build(),
+                #[cfg(feature = "shader")]
+                glib::ParamSpecString::builder("shader-preset")
+                    .nick("Shader Preset")
+                    .blurb("Path to a RetroArch-compatible .slangp shader preset for the primary output")
+                    .construct()
+                    .build(),
+                #[cfg(feature = "shader")]
+                glib::ParamSpecString::builder("shader-params")
+                    .nick("Shader Parameters")
+                    .blurb("Semicolon-separated shader parameter overrides (e.g. PARAM1=0.5;PARAM2=1.0)")
+                    .construct()
+                    .build(),
+                #[cfg(feature = "shader")]
+                glib::ParamSpecString::builder("secondary-shader-preset")
+                    .nick("Secondary Shader Preset")
+                    .blurb("Path to a .slangp shader preset for the secondary output")
+                    .construct()
+                    .build(),
+                #[cfg(feature = "shader")]
+                glib::ParamSpecString::builder("secondary-shader-params")
+                    .nick("Secondary Shader Parameters")
+                    .blurb("Semicolon-separated shader parameter overrides for secondary output")
+                    .construct()
+                    .build(),
             ]
         });
 
@@ -308,6 +345,34 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .get::<Option<String>>()
                     .expect("Type checked upstream");
             }
+            #[cfg(feature = "shader")]
+            "shader-preset" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.shader_preset = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream");
+            }
+            #[cfg(feature = "shader")]
+            "shader-params" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.shader_params = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream");
+            }
+            #[cfg(feature = "shader")]
+            "secondary-shader-preset" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.secondary_shader_preset = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream");
+            }
+            #[cfg(feature = "shader")]
+            "secondary-shader-params" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.secondary_shader_params = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream");
+            }
             _ => unreachable!(),
         }
     }
@@ -353,6 +418,26 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .clone()
                     .unwrap_or_default()
                     .to_value()
+            }
+            #[cfg(feature = "shader")]
+            "shader-preset" => {
+                let settings = self.settings.lock().unwrap();
+                settings.shader_preset.clone().unwrap_or_default().to_value()
+            }
+            #[cfg(feature = "shader")]
+            "shader-params" => {
+                let settings = self.settings.lock().unwrap();
+                settings.shader_params.clone().unwrap_or_default().to_value()
+            }
+            #[cfg(feature = "shader")]
+            "secondary-shader-preset" => {
+                let settings = self.settings.lock().unwrap();
+                settings.secondary_shader_preset.clone().unwrap_or_default().to_value()
+            }
+            #[cfg(feature = "shader")]
+            "secondary-shader-params" => {
+                let settings = self.settings.lock().unwrap();
+                settings.secondary_shader_params.clone().unwrap_or_default().to_value()
             }
             _ => unreachable!(),
         }
@@ -898,6 +983,38 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         }
 
         *state = Some(State { display, socket_name: wayland_socket_name, secondary_pipeline });
+
+        // Send shader presets to the compositor if configured.
+        // This must happen after state is set so the compositor thread is running.
+        // The actual shader loading is deferred until the first frame (when video info is set).
+        #[cfg(feature = "shader")]
+        {
+            let settings = self.settings.lock().unwrap();
+
+            // Primary shader: property or env var GST_WD_SHADER_PRESET
+            let preset = settings.shader_preset.clone().or_else(|| {
+                std::env::var("GST_WD_SHADER_PRESET").ok().filter(|s| !s.is_empty())
+            });
+            let params = settings.shader_params.clone().or_else(|| {
+                std::env::var("GST_WD_SHADER_PARAMS").ok()
+            }).unwrap_or_default();
+            if let Some(preset_path) = preset {
+                tracing::info!("Sending shader preset to compositor: {}", preset_path);
+                let _ = self.command_tx.send(Command::SetShaderPreset(preset_path, params));
+            }
+
+            // Secondary shader: property or env var GST_WD_SECONDARY_SHADER_PRESET
+            let sec_preset = settings.secondary_shader_preset.clone().or_else(|| {
+                std::env::var("GST_WD_SECONDARY_SHADER_PRESET").ok().filter(|s| !s.is_empty())
+            });
+            let sec_params = settings.secondary_shader_params.clone().or_else(|| {
+                std::env::var("GST_WD_SECONDARY_SHADER_PARAMS").ok()
+            }).unwrap_or_default();
+            if let Some(preset_path) = sec_preset {
+                tracing::info!("Sending secondary shader preset to compositor: {}", preset_path);
+                let _ = self.command_tx.send(Command::SetSecondaryShaderPreset(preset_path, sec_params));
+            }
+        }
 
         Ok(())
     }
