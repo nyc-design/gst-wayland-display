@@ -78,8 +78,11 @@ impl State {
                                     data.seat.get_keyboard().unwrap().current_focus()
                                 {
                                     match target {
-                                        FocusTarget::Wayland(window) => {
-                                            window.toplevel().unwrap().send_close();
+                                        FocusTarget::Window(window) => {
+                                            // Only close Wayland toplevels; X11 windows handle close differently
+                                            if let Some(toplevel) = window.toplevel() {
+                                                toplevel.send_close();
+                                            }
                                         }
                                         _ => return FilterResult::Forward,
                                     };

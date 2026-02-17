@@ -935,48 +935,51 @@ pub(crate) fn init(
         .unwrap();
 
     // Initialize Xwayland for X11 app support
-    let xwayland = XWayland::new(&state.dh);
     let xwayland_handle = event_loop.handle();
-    if let Err(e) = xwayland.start(
-        xwayland_handle.clone(),
+    match XWayland::spawn(
+        &state.dh,
         None, // Let Xwayland find its own display number
         std::iter::empty::<(&str, &str)>(), // No extra env vars
         true, // Use abstract socket
-        |_| {},
+        std::process::Stdio::null(),
+        std::process::Stdio::null(),
+        |_| {}, // No user data initialization
     ) {
-        tracing::warn!(?e, "Failed to start Xwayland. X11 apps will not work.");
-    } else {
-        tracing::info!("Xwayland started. X11 applications are supported.");
+        Ok((xwayland, _client)) => {
+            tracing::info!("Xwayland spawned. Waiting for ready event...");
+            // Handle Xwayland events
+            xwayland_handle
+                .insert_source(xwayland, move |event, _, state| match event {
+                    XWaylandEvent::Ready {
+                        x11_socket,
+                        display_number,
+                    } => {
+                        tracing::info!(display_number, "Xwayland is ready");
+                        // Start the X11 window manager
+                        match X11Wm::start_wm(
+                            state.handle.clone(),
+                            x11_socket,
+                            state.dh.clone(),
+                        ) {
+                            Ok(wm) => {
+                                state.xwm = Some(wm);
+                                tracing::info!("X11 window manager started");
+                            }
+                            Err(e) => {
+                                tracing::error!(?e, "Failed to start X11 window manager");
+                            }
+                        }
+                    }
+                    XWaylandEvent::Error => {
+                        tracing::error!("Xwayland error");
+                    }
+                })
+                .expect("Failed to add Xwayland event source");
+        }
+        Err(e) => {
+            tracing::warn!(?e, "Failed to spawn Xwayland. X11 apps will not work.");
+        }
     }
-
-    // Handle Xwayland events
-    xwayland_handle
-        .insert_source(xwayland, move |event, _, state| match event {
-            XWaylandEvent::Ready {
-                x11_socket,
-                display_number,
-            } => {
-                tracing::info!(display_number, "Xwayland is ready");
-                // Start the X11 window manager
-                match X11Wm::start_wm(
-                    state.handle.clone(),
-                    x11_socket,
-                    state.dh.clone(),
-                ) {
-                    Ok(wm) => {
-                        state.xwm = Some(wm);
-                        tracing::info!("X11 window manager started");
-                    }
-                    Err(e) => {
-                        tracing::error!(?e, "Failed to start X11 window manager");
-                    }
-                }
-            }
-            XWaylandEvent::Error => {
-                tracing::error!("Xwayland error");
-            }
-        })
-        .expect("Failed to add Xwayland event source");
 
     let env_vars = vec![CString::new(format!("WAYLAND_DISPLAY={}", socket_name)).unwrap()];
     if let Err(err) = envs_tx.send(env_vars) {

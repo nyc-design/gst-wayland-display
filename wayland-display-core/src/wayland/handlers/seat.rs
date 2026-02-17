@@ -19,7 +19,7 @@ impl SeatHandler for State {
     fn focus_changed(&mut self, seat: &Seat<Self>, focus: Option<&Self::KeyboardFocus>) {
         if let Some(surface) = focus {
             let client = match surface {
-                FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
+                FocusTarget::Window(w) => w.wl_surface().and_then(|s| s.client()),
                 FocusTarget::Popup(p) => p.wl_surface().client(),
             };
             set_data_device_focus(&self.dh, seat, client);
