@@ -9,4 +9,5 @@ pub mod seat;
 pub mod shm;
 pub mod viewporter;
 pub mod wl_drm;
+pub mod x11;
 pub mod xdg;

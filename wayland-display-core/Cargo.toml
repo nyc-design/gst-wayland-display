@@ -50,5 +50,6 @@ features = [
     "renderer_gl",
     "use_system_lib",
     "desktop",
-    "wayland_frontend"
+    "wayland_frontend",
+    "xwayland"
 ]
