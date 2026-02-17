@@ -53,6 +53,9 @@ pub struct Settings {
     input_devices: Vec<String>,
     disable_intel_workaround: bool,
     multi_output: bool,
+    /// Name for the secondary interpipesink (e.g. "{session_id}_secondary_video").
+    /// When set with multi-output=true, a secondary pipeline is auto-spawned in-process.
+    secondary_sink_name: Option<String>,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -63,6 +66,8 @@ pub struct State {
     display: WaylandDisplay,
     /// Wayland socket name, stored so we can unregister from the compositor registry on stop.
     socket_name: Option<String>,
+    /// The auto-spawned secondary pipeline (when multi-output + secondary-sink-name are set).
+    secondary_pipeline: Option<gst::Pipeline>,
 }
 
 #[glib::object_subclass]
@@ -223,6 +228,13 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecString::builder("secondary-sink-name")
+                    .nick("Secondary Interpipe Sink Name")
+                    .blurb(
+                        "When set with multi-output=true, auto-spawns an in-process secondary pipeline ending in an interpipesink with this name",
+                    )
+                    .construct()
+                    .build(),
             ]
         });
 
@@ -290,6 +302,12 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let mut settings = self.settings.lock().unwrap();
                 settings.multi_output = value.get::<bool>().expect("Type checked upstream");
             }
+            "secondary-sink-name" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.secondary_sink_name = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream");
+            }
             _ => unreachable!(),
         }
     }
@@ -327,6 +345,14 @@ impl ObjectImpl for WaylandDisplaySrc {
             "multi-output" => {
                 let settings = self.settings.lock().unwrap();
                 settings.multi_output.to_value()
+            }
+            "secondary-sink-name" => {
+                let settings = self.settings.lock().unwrap();
+                settings
+                    .secondary_sink_name
+                    .clone()
+                    .unwrap_or_default()
+                    .to_value()
             }
             _ => unreachable!(),
         }
@@ -799,27 +825,93 @@ impl BaseSrcImpl for WaylandDisplaySrc {
 
         // If multi-output mode is enabled, enable it on the compositor and
         // register in the global registry so the secondary element can find us.
+        // Check both the GStreamer property AND environment variables (for Wolf
+        // integration where we can't modify the pipeline string).
+        let mut secondary_pipeline = None;
         {
-            let settings = self.settings.lock().unwrap();
+            let mut settings = self.settings.lock().unwrap();
+
+            // Environment variable overrides: allows enabling multi-output
+            // without modifying Wolf's hardcoded pipeline string.
+            if !settings.multi_output {
+                if std::env::var("GST_WD_MULTI_OUTPUT").unwrap_or_default() == "1" {
+                    settings.multi_output = true;
+                    tracing::info!("Multi-output enabled via GST_WD_MULTI_OUTPUT env var");
+                }
+            }
+            if settings.secondary_sink_name.is_none() {
+                if let Ok(name) = std::env::var("GST_WD_SECONDARY_SINK_NAME") {
+                    if !name.is_empty() {
+                        tracing::info!("Secondary sink name from env: {}", name);
+                        settings.secondary_sink_name = Some(name);
+                    }
+                }
+            }
+
             if settings.multi_output {
                 display.enable_multi_output();
                 if let Some(ref socket_name) = wayland_socket_name {
                     waylanddisplaycore::register_compositor(socket_name, self.command_tx.clone());
                     tracing::info!("Multi-output mode enabled, compositor registered as '{}'", socket_name);
+
+                    // Auto-spawn secondary pipeline if secondary-sink-name is set.
+                    // This creates an in-process GStreamer pipeline:
+                    //   waylanddisplaysecondary compositor-name=<socket> ! capsfilter ! interpipesink
+                    // Running in the same Wolf process means interpipe can see both sinks.
+                    if let Some(ref sink_name) = settings.secondary_sink_name {
+                        // Use video/x-raw for the secondary stream — the secondary compositor
+                        // output will handle the actual resolution based on the window size.
+                        let pipeline_str = format!(
+                            "waylanddisplaysecondary compositor-name={socket} ! \
+                             interpipesink sync=true async=false name={sink} max-buffers=1",
+                            socket = socket_name,
+                            sink = sink_name,
+                        );
+                        tracing::info!("Starting secondary pipeline: {}", pipeline_str);
+                        match gst::parse::launch(&pipeline_str) {
+                            Ok(element) => {
+                                // parse_launch returns an Element; for a pipeline it's actually a Pipeline
+                                let pipeline = element.downcast::<gst::Pipeline>().unwrap_or_else(|e| {
+                                    // If it's a Bin, wrap it
+                                    let bin = e.downcast::<gst::Bin>().expect("Expected Pipeline or Bin");
+                                    // Create a pipeline and add the bin
+                                    let p = gst::Pipeline::new();
+                                    p.add(&bin).expect("Failed to add bin to pipeline");
+                                    p
+                                });
+                                if let Err(err) = pipeline.set_state(gst::State::Playing) {
+                                    tracing::warn!("Failed to start secondary pipeline: {:?}", err);
+                                } else {
+                                    tracing::info!("Secondary pipeline started with sink '{}'", sink_name);
+                                    secondary_pipeline = Some(pipeline);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!("Failed to parse secondary pipeline: {:?}", err);
+                            }
+                        }
+                    }
                 } else {
                     tracing::warn!("Multi-output enabled but no WAYLAND_DISPLAY found in env vars");
                 }
             }
         }
 
-        *state = Some(State { display, socket_name: wayland_socket_name });
+        *state = Some(State { display, socket_name: wayland_socket_name, secondary_pipeline });
 
         Ok(())
     }
 
     fn stop(&self) -> Result<(), gst::ErrorMessage> {
         let mut state = self.state.lock().unwrap();
-        if let Some(s) = state.take() {
+        if let Some(mut s) = state.take() {
+            // Stop secondary pipeline if running
+            if let Some(ref pipeline) = s.secondary_pipeline {
+                tracing::info!("Stopping secondary pipeline");
+                let _ = pipeline.set_state(gst::State::Null);
+            }
+            s.secondary_pipeline = None;
+
             // Unregister from global compositor registry if multi-output was enabled
             if let Some(ref socket_name) = s.socket_name {
                 let settings = self.settings.lock().unwrap();
