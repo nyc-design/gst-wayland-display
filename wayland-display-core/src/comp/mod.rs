@@ -84,6 +84,8 @@ use crate::utils::allocator::{
 };
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::renderer::setup_renderer;
+#[cfg(feature = "shader")]
+use crate::shader::ShaderState;
 use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
 
 #[derive(Debug, Default)]
@@ -130,6 +132,12 @@ pub struct State {
     surpressed_keys: HashSet<u32>,
     pub pending_windows: Vec<Window>,
     input_context: Libinput,
+
+    // shader state
+    #[cfg(feature = "shader")]
+    pub(crate) shader_state: Option<ShaderState>,
+    #[cfg(feature = "shader")]
+    pub(crate) secondary_shader_state: Option<ShaderState>,
 
     // multi-output management
     pub multi_output_enabled: bool,
@@ -263,6 +271,12 @@ impl State {
             surpressed_keys: HashSet::new(),
             pending_windows: Vec::new(),
             input_context: input_context.clone(),
+
+            // shader state
+            #[cfg(feature = "shader")]
+            shader_state: None,
+            #[cfg(feature = "shader")]
+            secondary_shader_state: None,
 
             // multi-output management
             multi_output_enabled: false,
@@ -756,6 +770,78 @@ pub(crate) fn init(
                         }
                         None => render(state, Instant::now()),
                     };
+                }
+                #[cfg(feature = "shader")]
+                Event::Msg(Command::SetShaderPreset(preset_path, params_str)) => {
+                    if preset_path.is_empty() {
+                        tracing::info!("Clearing shader preset on primary output");
+                        state.shader_state = None;
+                    } else {
+                        // Determine resolution from current video info
+                        let (w, h) = match state.video_info.as_ref() {
+                            Some(vi) => (vi.width(), vi.height()),
+                            None => {
+                                tracing::warn!("SetShaderPreset: no video info yet, deferring");
+                                // TODO: queue for later
+                                return;
+                            }
+                        };
+                        let param_overrides = crate::shader::parse_shader_params(&params_str);
+                        let egl_ctx = state.renderer.egl_context();
+                        let display = egl_ctx.display();
+                        match ShaderState::new(
+                            &preset_path,
+                            &param_overrides,
+                            |name| {
+                                display.get_proc_address(name).unwrap_or(std::ptr::null()) as *const std::ffi::c_void
+                            },
+                            w,
+                            h,
+                        ) {
+                            Ok(ss) => {
+                                tracing::info!("Shader preset loaded on primary output: {}", preset_path);
+                                state.shader_state = Some(ss);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to load shader preset '{}': {}", preset_path, e);
+                            }
+                        }
+                    }
+                }
+                #[cfg(feature = "shader")]
+                Event::Msg(Command::SetSecondaryShaderPreset(preset_path, params_str)) => {
+                    if preset_path.is_empty() {
+                        tracing::info!("Clearing shader preset on secondary output");
+                        state.secondary_shader_state = None;
+                    } else {
+                        let (w, h) = match state.secondary_video_info.as_ref() {
+                            Some(vi) => (vi.width(), vi.height()),
+                            None => {
+                                tracing::warn!("SetSecondaryShaderPreset: no secondary video info yet");
+                                return;
+                            }
+                        };
+                        let param_overrides = crate::shader::parse_shader_params(&params_str);
+                        let egl_ctx = state.renderer.egl_context();
+                        let display = egl_ctx.display();
+                        match ShaderState::new(
+                            &preset_path,
+                            &param_overrides,
+                            |name| {
+                                display.get_proc_address(name).unwrap_or(std::ptr::null()) as *const std::ffi::c_void
+                            },
+                            w,
+                            h,
+                        ) {
+                            Ok(ss) => {
+                                tracing::info!("Shader preset loaded on secondary output: {}", preset_path);
+                                state.secondary_shader_state = Some(ss);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to load secondary shader preset '{}': {}", preset_path, e);
+                            }
+                        }
+                    }
                 }
                 Event::Msg(Command::Quit) | Event::Closed => {
                     state.should_quit = true;

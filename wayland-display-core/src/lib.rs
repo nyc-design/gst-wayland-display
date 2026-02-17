@@ -68,6 +68,8 @@ pub fn lookup_active_compositor() -> Option<Sender<Command>> {
 }
 
 pub(crate) mod comp;
+#[cfg(feature = "shader")]
+pub mod shader;
 #[cfg(test)]
 mod tests;
 pub mod utils;
@@ -97,6 +99,16 @@ pub enum Command {
     TouchCancel,
     TouchFrame,
     Quit,
+
+    // --- Shader extensions ---
+    /// Set a RetroArch-compatible shader preset (.slangp) on the primary output.
+    /// (preset_path, param_overrides_str)
+    /// param_overrides_str format: "PARAM1=0.5;PARAM2=1.0"
+    #[cfg(feature = "shader")]
+    SetShaderPreset(String, String),
+    /// Set a RetroArch-compatible shader preset on the secondary output.
+    #[cfg(feature = "shader")]
+    SetSecondaryShaderPreset(String, String),
 
     // --- Multi-output extensions ---
     /// Enable multi-output mode. The compositor will create a secondary output
@@ -355,6 +367,19 @@ impl WaylandDisplay {
                 Err(gst::FlowError::Error)
             }
         }
+    }
+
+    /// Set a RetroArch-compatible shader preset (.slangp) on the primary output.
+    /// `params` is a semicolon-separated string: "PARAM1=0.5;PARAM2=1.0"
+    #[cfg(feature = "shader")]
+    pub fn set_shader_preset(&self, preset_path: impl Into<String>, params: impl Into<String>) {
+        let _ = self.command_tx.send(Command::SetShaderPreset(preset_path.into(), params.into()));
+    }
+
+    /// Set a RetroArch-compatible shader preset on the secondary output.
+    #[cfg(feature = "shader")]
+    pub fn set_secondary_shader_preset(&self, preset_path: impl Into<String>, params: impl Into<String>) {
+        let _ = self.command_tx.send(Command::SetSecondaryShaderPreset(preset_path.into(), params.into()));
     }
 
     /// Enable multi-output mode. The compositor will create a secondary output

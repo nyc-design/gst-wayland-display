@@ -19,6 +19,7 @@ static = []
 capi = []
 doc = []
 cuda = []
+shader = ["wayland-display-core/shader"]
 
 [dependencies]
 gst.workspace = true

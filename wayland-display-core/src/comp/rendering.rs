@@ -83,6 +83,17 @@ impl State {
             [0.0, 0.0, 0.0, 1.0],
         )?;
 
+        // Apply shader post-processing if configured
+        #[cfg(feature = "shader")]
+        if let Some(ref mut shader_state) = self.shader_state {
+            let vi = self.video_info.as_ref().unwrap();
+            let w = vi.width();
+            let h = vi.height();
+            if let Err(e) = Self::apply_shader(&self.renderer, shader_state, w, h) {
+                tracing::warn!("Shader apply failed: {}, falling through without shader", e);
+            }
+        }
+
         match self
             .output_buffer
             .clone()
@@ -131,6 +142,17 @@ impl State {
             [0.0, 0.0, 0.0, 1.0],
         )?;
 
+        // Apply shader post-processing if configured
+        #[cfg(feature = "shader")]
+        if let Some(ref mut shader_state) = self.secondary_shader_state {
+            let vi = self.secondary_video_info.as_ref().unwrap();
+            let w = vi.width();
+            let h = vi.height();
+            if let Err(e) = Self::apply_shader(&self.renderer, shader_state, w, h) {
+                tracing::warn!("Secondary shader apply failed: {}", e);
+            }
+        }
+
         match self
             .secondary_output_buffer
             .clone()
@@ -143,5 +165,93 @@ impl State {
                 Err(OutputDamageTrackerError::Rendering(GlesError::MappingError))
             }
         }
+    }
+
+    /// Apply the librashader filter chain to the currently-bound output FBO.
+    ///
+    /// Flow:
+    /// 1. The output FBO already contains the composited frame (from render_output)
+    /// 2. Blit output FBO → shader input FBO (captures frame for shader to read)
+    /// 3. Run shader chain: input_tex → output_tex
+    /// 4. Blit shader output FBO → output FBO (writes result back)
+    ///
+    /// This two-intermediate approach works with all buffer types (RAW, DMA, CUDA)
+    /// because we operate purely at the GL level before to_gs_buffer() is called.
+    #[cfg(feature = "shader")]
+    fn apply_shader(
+        renderer: &smithay::backend::renderer::gles::GlesRenderer,
+        shader_state: &mut crate::shader::ShaderState,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use smithay::backend::renderer::gles::ffi;
+
+        // Ensure intermediate textures match current resolution
+        shader_state.resize(width, height)?;
+
+        let input_fbo_id = shader_state.input_fbo_id();
+        let output_fbo_id = shader_state.output_fbo_id();
+
+        // Step 1: Blit composited frame from the real output FBO → shader input FBO
+        renderer
+            .with_context(|gl| unsafe {
+                // Get the currently-bound draw framebuffer (the output buffer's FBO)
+                let mut real_fbo_id: i32 = 0;
+                gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut real_fbo_id);
+                let real_fbo_id = real_fbo_id as u32;
+
+                // Blit: output FBO (READ) → shader input FBO (DRAW)
+                gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, real_fbo_id);
+                gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, input_fbo_id);
+                gl.BlitFramebuffer(
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    ffi::COLOR_BUFFER_BIT,
+                    ffi::NEAREST,
+                );
+
+                // Restore the real output FBO
+                gl.BindFramebuffer(ffi::FRAMEBUFFER, real_fbo_id);
+            })
+            .map_err(|e| format!("blit to input failed: {:?}", e))?;
+
+        // Step 2: Run librashader filter chain (input_tex → output_tex)
+        shader_state.apply()?;
+
+        // Step 3: Blit shader output FBO → real output FBO
+        renderer
+            .with_context(|gl| unsafe {
+                let mut real_fbo_id: i32 = 0;
+                gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut real_fbo_id);
+                let real_fbo_id = real_fbo_id as u32;
+
+                // Blit: shader output FBO (READ) → real output FBO (DRAW)
+                gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, output_fbo_id);
+                gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, real_fbo_id);
+                gl.BlitFramebuffer(
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    ffi::COLOR_BUFFER_BIT,
+                    ffi::NEAREST,
+                );
+
+                // Restore the real output FBO
+                gl.BindFramebuffer(ffi::FRAMEBUFFER, real_fbo_id);
+            })
+            .map_err(|e| format!("blit from output failed: {:?}", e))?;
+
+        Ok(())
     }
 }
