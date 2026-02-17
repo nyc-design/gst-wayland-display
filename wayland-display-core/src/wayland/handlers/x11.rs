@@ -14,7 +14,7 @@ use std::os::unix::io::OwnedFd;
 
 use smithay::{
     delegate_xwayland_shell,
-    desktop::Window,
+    desktop::{Window, WindowSurface},
     utils::{Logical, Rectangle, SERIAL_COUNTER},
     wayland::{
         selection::{
@@ -34,6 +34,22 @@ use smithay::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::comp::{FocusTarget, State};
+
+/// Helper to check if a Window wraps a specific X11Surface
+fn window_matches_x11(window: &Window, x11_surface: &X11Surface) -> bool {
+    match window.underlying_surface() {
+        WindowSurface::X11(s) => &s == x11_surface,
+        WindowSurface::Wayland(_) => false,
+    }
+}
+
+/// Helper to extract X11Surface from a Window if it wraps one
+fn get_x11_surface(window: &Window) -> Option<X11Surface> {
+    match window.underlying_surface() {
+        WindowSurface::X11(s) => Some(s.clone()),
+        WindowSurface::Wayland(_) => None,
+    }
+}
 
 // Implement XWaylandShellHandler for the xwayland-shell protocol
 impl XWaylandShellHandler for State {
@@ -153,7 +169,7 @@ impl XwmHandler for State {
         let maybe_primary = self
             .space
             .elements()
-            .find(|e| matches!(e.x11_surface(), Some(w) if w == &window))
+            .find(|e| window_matches_x11(e, &window))
             .cloned();
         if let Some(elem) = maybe_primary {
             self.space.unmap_elem(&elem);
@@ -163,7 +179,7 @@ impl XwmHandler for State {
         let maybe_secondary = self
             .secondary_space
             .elements()
-            .find(|e| matches!(e.x11_surface(), Some(w) if w == &window))
+            .find(|e| window_matches_x11(e, &window))
             .cloned();
         if let Some(elem) = maybe_secondary {
             self.secondary_space.unmap_elem(&elem);
@@ -210,20 +226,22 @@ impl XwmHandler for State {
         _above: Option<u32>,
     ) {
         // Update element position if it changed
-        if let Some(elem) = self
+        // Clone the element first to avoid borrow issues
+        let primary_elem = self
             .space
             .elements()
-            .find(|e| matches!(e.x11_surface(), Some(w) if w == &window))
-            .cloned()
-        {
+            .find(|e| window_matches_x11(e, &window))
+            .cloned();
+        if let Some(elem) = primary_elem {
             self.space.map_element(elem, geometry.loc, false);
         }
-        if let Some(elem) = self
+
+        let secondary_elem = self
             .secondary_space
             .elements()
-            .find(|e| matches!(e.x11_surface(), Some(w) if w == &window))
-            .cloned()
-        {
+            .find(|e| window_matches_x11(e, &window))
+            .cloned();
+        if let Some(elem) = secondary_elem {
             self.secondary_space.map_element(elem, geometry.loc, false);
         }
     }
@@ -246,7 +264,7 @@ impl XwmHandler for State {
         let is_secondary = self
             .secondary_space
             .elements()
-            .any(|e| matches!(e.x11_surface(), Some(w) if w == &window));
+            .any(|e| window_matches_x11(e, &window));
 
         let output = if is_secondary {
             self.secondary_output.as_ref()
@@ -300,7 +318,7 @@ impl XwmHandler for State {
         // Allow clipboard access when an X11 window is focused
         if let Some(keyboard) = self.seat.get_keyboard() {
             if let Some(FocusTarget::Window(w)) = keyboard.current_focus() {
-                if let Some(surface) = w.x11_surface() {
+                if let Some(surface) = get_x11_surface(&w) {
                     if surface.xwm_id().unwrap() == xwm {
                         return true;
                     }
