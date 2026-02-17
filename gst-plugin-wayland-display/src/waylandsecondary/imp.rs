@@ -1,4 +1,5 @@
 use gst::glib;
+use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst::{Fraction, LoggableError};
 use gst_base::prelude::BaseSrcExt;
