@@ -82,10 +82,14 @@ impl CompositorHandler for State {
 
             if !initial_configure_sent {
                 // Determine which output to use for sizing this toplevel.
-                // In multi-output mode, the 2nd+ toplevel goes to the secondary output.
+                // In multi-output mode, route first live toplevel to primary space
+                // and second live toplevel to secondary space.
+                let primary_count = self.space.elements().count();
+                let secondary_count = self.secondary_space.elements().count();
                 let use_secondary = self.multi_output_enabled
-                    && self.toplevel_count >= 1
-                    && self.secondary_output.is_some();
+                    && self.secondary_output.is_some()
+                    && primary_count >= 1
+                    && secondary_count == 0;
 
                 let target_output = if use_secondary {
                     self.secondary_output.as_ref().unwrap()
@@ -118,23 +122,21 @@ impl CompositorHandler for State {
                 self.pending_windows.push(window);
             } else {
                 // Determine which space to map into.
-                // In multi-output mode, the 2nd+ toplevel goes to secondary_space.
+                // In multi-output mode, route first live toplevel to primary space
+                // and second live toplevel to secondary space.
+                let primary_count = self.space.elements().count();
+                let secondary_count = self.secondary_space.elements().count();
                 let use_secondary = self.multi_output_enabled
-                    && self.toplevel_count >= 1
-                    && self.secondary_output.is_some();
+                    && self.secondary_output.is_some()
+                    && primary_count >= 1
+                    && secondary_count == 0;
 
                 let loc = (0, 0);
                 if use_secondary {
-                    tracing::info!(
-                        "Mapping toplevel #{} to secondary space",
-                        self.toplevel_count
-                    );
+                    tracing::info!("Mapping toplevel to secondary space");
                     self.secondary_space.map_element(window.clone(), loc, true);
                 } else {
-                    tracing::info!(
-                        "Mapping toplevel #{} to primary space",
-                        self.toplevel_count
-                    );
+                    tracing::info!("Mapping toplevel to primary space");
                     self.space.map_element(window.clone(), loc, true);
                 }
                 self.toplevel_count += 1;

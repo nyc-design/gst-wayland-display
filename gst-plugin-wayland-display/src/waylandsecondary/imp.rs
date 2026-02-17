@@ -7,6 +7,7 @@ use gst_base::subclass::prelude::*;
 use gst_video::{VideoCapsBuilder, VideoFormat, VideoInfo, VideoInfoDmaDrm};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 #[cfg(feature = "cuda")]
 use waylanddisplaycore::utils::allocator::cuda;
 use waylanddisplaycore::{Command, GstVideoInfo, Sender};
@@ -256,29 +257,36 @@ impl BaseSrcImpl for WaylandDisplaySecondary {
             settings.compositor_name.clone()
         };
 
-        let Some(name) = compositor_name else {
-            return Err(gst::error_msg!(
-                gst::LibraryError::Settings,
-                ("compositor-name property must be set on waylanddisplaysecondary")
-            ));
-        };
+        // Wait briefly for the primary compositor to register. This makes the
+        // bottom-screen app resilient to startup ordering.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let tx = match compositor_name.as_ref() {
+                Some(name) => waylanddisplaycore::lookup_compositor(name),
+                None => waylanddisplaycore::lookup_active_compositor(),
+            };
 
-        // Look up the shared compositor from the global registry
-        let tx = waylanddisplaycore::lookup_compositor(&name);
-        match tx {
-            Some(tx) => {
-                tracing::info!("Secondary element connected to compositor '{}'", name);
+            if let Some(tx) = tx {
+                let label = compositor_name.as_deref().unwrap_or("<active>");
+                tracing::info!("Secondary element connected to compositor '{}'", label);
                 let mut compositor_tx = self.compositor_tx.lock().unwrap();
                 *compositor_tx = Some(tx);
-                Ok(())
+                return Ok(());
             }
-            None => Err(gst::error_msg!(
-                gst::LibraryError::Failed,
-                (
-                    "Could not find compositor '{}' in registry. Make sure waylanddisplaysrc with multi-output=true is running first.",
-                    name
-                )
-            )),
+
+            if Instant::now() >= deadline {
+                let msg = match compositor_name.as_ref() {
+                    Some(name) => format!(
+                        "Could not find compositor '{}' in registry. Start the primary dual-screen app first.",
+                        name
+                    ),
+                    None => "No active compositor found. Start the primary dual-screen app first."
+                        .to_string(),
+                };
+                return Err(gst::error_msg!(gst::LibraryError::Failed, ("{}", msg)));
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -299,29 +307,34 @@ impl PushSrcImpl for WaylandDisplaySecondary {
         &self,
         _buffer: Option<&mut gst::BufferRef>,
     ) -> Result<CreateSuccess, gst::FlowError> {
-        let compositor_tx = self.compositor_tx.lock().unwrap();
-        let Some(ref tx) = *compositor_tx else {
+        let tx = {
+            let compositor_tx = self.compositor_tx.lock().unwrap();
+            compositor_tx.clone()
+        };
+        let Some(tx) = tx else {
             return Err(gst::FlowError::Eos);
         };
 
-        // Request a frame from the secondary output via the shared compositor
-        let (buffer_tx, buffer_rx) = std::sync::mpsc::sync_channel(0);
-        if let Err(err) = tx.send(Command::SecondaryBuffer(buffer_tx, None)) {
-            tracing::warn!(?err, "Failed to send secondary buffer command.");
-            return Err(gst::FlowError::Eos);
-        }
-
-        match buffer_rx.recv() {
-            Ok(Ok(buffer)) => Ok(CreateSuccess::NewBuffer(buffer)),
-            Ok(Err(err)) => {
-                tracing::debug!(?err, "Secondary frame not ready yet");
-                // Temporary failure — secondary output may not be set up yet.
-                // Return a flow error that causes a retry.
-                Err(gst::FlowError::Error)
+        // Request frames until secondary output is ready.
+        // Avoid returning FlowError::Error for transient "not ready yet" cases,
+        // which can permanently tear down the pipeline.
+        loop {
+            let (buffer_tx, buffer_rx) = std::sync::mpsc::sync_channel(0);
+            if let Err(err) = tx.send(Command::SecondaryBuffer(buffer_tx, None)) {
+                tracing::warn!(?err, "Failed to send secondary buffer command.");
+                return Err(gst::FlowError::Eos);
             }
-            Err(err) => {
-                tracing::warn!(?err, "Failed to recv secondary buffer ack.");
-                Err(gst::FlowError::Error)
+
+            match buffer_rx.recv() {
+                Ok(Ok(buffer)) => return Ok(CreateSuccess::NewBuffer(buffer)),
+                Ok(Err(err)) => {
+                    tracing::debug!(?err, "Secondary frame not ready yet; retrying");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "Failed to recv secondary buffer ack.");
+                    return Err(gst::FlowError::Error);
+                }
             }
         }
     }

@@ -25,11 +25,15 @@ use utils::RenderTarget;
 
 static COMPOSITOR_REGISTRY: std::sync::LazyLock<Mutex<HashMap<String, Sender<Command>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static ACTIVE_COMPOSITOR: std::sync::LazyLock<Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 /// Register a compositor's command sender under its Wayland socket name.
 pub fn register_compositor(socket_name: &str, sender: Sender<Command>) {
     let mut registry = COMPOSITOR_REGISTRY.lock().unwrap();
     registry.insert(socket_name.to_string(), sender);
+    let mut active = ACTIVE_COMPOSITOR.lock().unwrap();
+    *active = Some(socket_name.to_string());
     tracing::info!("Registered compositor for socket: {}", socket_name);
 }
 
@@ -37,6 +41,10 @@ pub fn register_compositor(socket_name: &str, sender: Sender<Command>) {
 pub fn unregister_compositor(socket_name: &str) {
     let mut registry = COMPOSITOR_REGISTRY.lock().unwrap();
     registry.remove(socket_name);
+    let mut active = ACTIVE_COMPOSITOR.lock().unwrap();
+    if active.as_deref() == Some(socket_name) {
+        *active = registry.keys().next().cloned();
+    }
     tracing::info!("Unregistered compositor for socket: {}", socket_name);
 }
 
@@ -44,6 +52,19 @@ pub fn unregister_compositor(socket_name: &str) {
 pub fn lookup_compositor(socket_name: &str) -> Option<Sender<Command>> {
     let registry = COMPOSITOR_REGISTRY.lock().unwrap();
     registry.get(socket_name).cloned()
+}
+
+/// Look up the currently active compositor.
+///
+/// This is primarily used by `waylanddisplaysecondary` when no explicit
+/// `compositor-name` is configured (single dual-screen session default).
+pub fn lookup_active_compositor() -> Option<Sender<Command>> {
+    let registry = COMPOSITOR_REGISTRY.lock().unwrap();
+    let active = ACTIVE_COMPOSITOR.lock().unwrap();
+    active
+        .as_ref()
+        .and_then(|socket| registry.get(socket))
+        .cloned()
 }
 
 pub(crate) mod comp;
