@@ -1,3 +1,4 @@
+use smithay::backend::SwapBuffersError;
 use super::{Command, DrmFormat, GstVideoInfo};
 use gst_video::VideoInfo;
 use smithay::backend::allocator::format::FormatSet;
@@ -101,13 +102,19 @@ pub struct State {
     should_quit: bool,
     pub(crate) clock: Clock<Monotonic>,
 
-    // render
+    // render — primary output
     pub(crate) dtr: Option<OutputDamageTracker>,
     pub(crate) output_buffer: Option<GsBufferType>,
     render_node: Option<DrmNode>,
     pub renderer: GlesRenderer,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
+
+    // render — secondary output (multi-output mode)
+    pub(crate) secondary_dtr: Option<OutputDamageTracker>,
+    pub(crate) secondary_output_buffer: Option<GsBufferType>,
+    pub(crate) secondary_video_info: Option<VideoInfo>,
+    pub(crate) secondary_last_render: Option<Instant>,
 
     // management
     pub output: Option<Output>,
@@ -123,6 +130,13 @@ pub struct State {
     surpressed_keys: HashSet<u32>,
     pub pending_windows: Vec<Window>,
     input_context: Libinput,
+
+    // multi-output management
+    pub multi_output_enabled: bool,
+    pub secondary_output: Option<Output>,
+    pub secondary_space: Space<Window>,
+    /// Tracks how many toplevel windows have been mapped (to route them)
+    pub toplevel_count: usize,
 
     // wayland state
     pub dh: DisplayHandle,
@@ -230,6 +244,12 @@ impl State {
             video_info: None,
             last_render: None,
 
+            // secondary output (multi-output mode) — initialized empty
+            secondary_dtr: None,
+            secondary_output_buffer: None,
+            secondary_video_info: None,
+            secondary_last_render: None,
+
             space,
             popups: PopupManager::default(),
             seat,
@@ -243,6 +263,12 @@ impl State {
             surpressed_keys: HashSet::new(),
             pending_windows: Vec::new(),
             input_context: input_context.clone(),
+
+            // multi-output management
+            multi_output_enabled: false,
+            secondary_output: None,
+            secondary_space: Space::default(),
+            toplevel_count: 0,
 
             dh: dh.clone(),
             compositor_state,
@@ -548,6 +574,189 @@ pub(crate) fn init(
                         cuda_buf.buffer_pool = pool;
                     }
                 }
+                // --- Multi-output command handlers ---
+                Event::Msg(Command::EnableMultiOutput) => {
+                    tracing::info!("Enabling multi-output mode");
+                    state.multi_output_enabled = true;
+                }
+                Event::Msg(Command::SecondaryVideoInfo(video_info)) => {
+                    if state.secondary_output.is_some() {
+                        tracing::info!(
+                            "Secondary output already running, ignoring newly negotiated video info"
+                        );
+                        return;
+                    }
+                    let base_info: VideoInfo = video_info.clone().into();
+                    tracing::info!(
+                        "Secondary output video format: {} ({}x{})",
+                        base_info.format(),
+                        base_info.width(),
+                        base_info.height()
+                    );
+                    let size: Size<i32, Physical> =
+                        (base_info.width() as i32, base_info.height() as i32).into();
+                    let framerate = base_info.fps();
+                    let duration = Duration::from_secs_f64(
+                        framerate.numer() as f64 / framerate.denom() as f64,
+                    );
+
+                    let output = state.secondary_output.get_or_insert_with(|| {
+                        let output = Output::new(
+                            "HEADLESS-2".into(),
+                            PhysicalProperties {
+                                make: "Virtual".into(),
+                                model: "Wolf-Secondary".into(),
+                                size: (0, 0).into(),
+                                subpixel: Subpixel::Unknown,
+                            },
+                        );
+                        output.create_global::<State>(&state.dh);
+                        output
+                    });
+                    let mode = OutputMode {
+                        size: size.into(),
+                        refresh: (duration.as_secs_f64() * 1000.0).round() as i32,
+                    };
+                    output.change_current_state(Some(mode), None, None, None);
+                    output.set_preferred(mode);
+                    let dtr = OutputDamageTracker::from_output(&output);
+
+                    state.secondary_space.map_output(&output, (0, 0));
+                    state.secondary_dtr = Some(dtr);
+                    state.secondary_video_info = Some(video_info.clone().into());
+                    match render_target {
+                        RenderTarget::Hardware(_) => match video_info {
+                            GstVideoInfo::RAW(base_info) => {
+                                let allocator = GsGlesbuffer::new(&mut state.renderer, base_info)
+                                    .expect("Failed to create secondary GsGlesbuffer");
+                                state.secondary_output_buffer = Some(GsBufferType::RAW(allocator));
+                            }
+                            GstVideoInfo::DMA(base_info) => {
+                                let allocator = GsDmaBuf::new(render_node.unwrap(), base_info)
+                                    .expect("Failed to create secondary GsDmaBuf");
+                                state.secondary_output_buffer = Some(GsBufferType::DMA(allocator));
+                            }
+                            #[cfg(feature = "cuda")]
+                            GstVideoInfo::CUDA(base_info) => {
+                                let egl_display = state
+                                    .renderer
+                                    .egl_context()
+                                    .display()
+                                    .get_display_handle()
+                                    .handle;
+                                let allocator = GsCUDABuf::new(
+                                    render_node.unwrap(),
+                                    base_info.cuda_context,
+                                    base_info.video_info,
+                                    Arc::new(Mutex::new(None)),
+                                    &egl_display,
+                                )
+                                .expect("Failed to create secondary GsCUDABuf");
+                                state.secondary_output_buffer = Some(GsBufferType::CUDA(allocator));
+                            }
+                        },
+                        RenderTarget::Software => {
+                            let allocator =
+                                GsGlesbuffer::new(&mut state.renderer, base_info.clone())
+                                    .expect("Failed to create secondary GsGlesbuffer");
+                            state.secondary_output_buffer = Some(GsBufferType::RAW(allocator));
+                        }
+                    }
+
+                    // Resize any window already mapped to the secondary space
+                    let new_size = size
+                        .to_f64()
+                        .to_logical(output.current_scale().fractional_scale())
+                        .to_i32_round();
+                    for window in state.secondary_space.elements() {
+                        let toplevel = window.toplevel().unwrap();
+                        toplevel.with_pending_state(|s| s.size = Some(new_size));
+                        toplevel.send_configure();
+                    }
+                }
+                Event::Msg(Command::SecondaryBuffer(buffer_sender, tracer)) => {
+                    if state.secondary_output.is_none()
+                        || state.secondary_dtr.is_none()
+                        || state.secondary_video_info.is_none()
+                        || state.secondary_output_buffer.is_none()
+                    {
+                        // Secondary output not ready yet — send a black frame or error
+                        let _ = buffer_sender.send(Err(SwapBuffersError::TemporaryFailure(
+                            smithay::backend::renderer::gles::GlesError::MappingError.into(),
+                        )));
+                        return;
+                    }
+
+                    let wait = if let Some(last_render) = state.secondary_last_render {
+                        let base_info = state.secondary_video_info.as_ref().unwrap().clone();
+                        let framerate = base_info.fps();
+                        let duration = Duration::from_secs_f64(
+                            framerate.denom() as f64 / framerate.numer() as f64,
+                        );
+                        let time_passed = Instant::now().duration_since(last_render);
+                        if time_passed < duration {
+                            Some(duration - time_passed)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let render = move |state: &mut State, now: Instant| {
+                        let _span = match tracer {
+                            Some(ref tracer) => Some(tracer.trace("render_secondary")),
+                            None => None,
+                        };
+                        if let Err(_) = match state.create_secondary_frame() {
+                            Ok((buf, render_result)) => {
+                                render_result
+                                    .sync
+                                    .wait()
+                                    .expect("Error during secondary render_result.sync");
+                                let res = buffer_sender.send(Ok(buf));
+                                // send frame callbacks for secondary space windows
+                                if let Some(output) = state.secondary_output.as_ref() {
+                                    for window in state.secondary_space.elements() {
+                                        window.send_frame(
+                                            output,
+                                            state.clock.now(),
+                                            Some(Duration::ZERO),
+                                            |_, _| Some(output.clone()),
+                                        );
+                                    }
+                                }
+                                state.secondary_last_render = Some(now);
+                                res
+                            }
+                            Err(err) => {
+                                tracing::error!(?err, "Secondary rendering failed.");
+                                buffer_sender.send(Err(match err {
+                                    DTRError::OutputNoMode(_) => unreachable!(),
+                                    DTRError::Rendering(err) => err.into(),
+                                }))
+                            }
+                        } {
+                            state.should_quit = true;
+                        }
+                    };
+
+                    match wait {
+                        Some(duration) => {
+                            if let Err(err) = state.handle.insert_source(
+                                Timer::from_duration(duration),
+                                move |now, _, data| {
+                                    render(data, now);
+                                    TimeoutAction::Drop
+                                },
+                            ) {
+                                tracing::error!(?err, "Event loop error (secondary).");
+                                state.should_quit = true;
+                            };
+                        }
+                        None => render(state, Instant::now()),
+                    };
+                }
                 Event::Msg(Command::Quit) | Event::Closed => {
                     state.should_quit = true;
                 }
@@ -723,6 +932,7 @@ pub(crate) fn init(
     if let Err(err) = event_loop.run(None, &mut state, |state| {
         state.dh.flush_clients().expect("Failed to flush clients");
         state.space.refresh();
+        state.secondary_space.refresh();
         state.popups.cleanup();
 
         if state.should_quit {

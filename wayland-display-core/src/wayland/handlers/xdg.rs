@@ -38,8 +38,10 @@ impl XdgShellHandler for State {
         let seat: Seat<State> = Seat::from_resource(&seat).unwrap();
         let kind = PopupKind::Xdg(surface.clone());
         if let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
+            // Search both primary and secondary spaces
             self.space
                 .elements()
+                .chain(self.secondary_space.elements())
                 .find(|w| w.wl_surface().map(|s| *s == root).unwrap_or(false))
                 .cloned()
                 .map(FocusTarget::from)
@@ -93,17 +95,27 @@ impl State {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        let Some(window) = self
+
+        // Check which space the window is in (primary or secondary)
+        let (space, window) = if let Some(w) = self
             .space
             .elements()
             .find(|w| w.toplevel().unwrap().wl_surface() == &root)
-        else {
+        {
+            (&self.space, w)
+        } else if let Some(w) = self
+            .secondary_space
+            .elements()
+            .find(|w| w.toplevel().unwrap().wl_surface() == &root)
+        {
+            (&self.secondary_space, w)
+        } else {
             return;
         };
 
-        let output = self.space.outputs().next().unwrap();
-        let output_geo = self.space.output_geometry(output).unwrap();
-        let window_geo = self.space.element_geometry(window).unwrap();
+        let output = space.outputs().next().unwrap();
+        let output_geo = space.output_geometry(output).unwrap();
+        let window_geo = space.element_geometry(window).unwrap();
 
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.

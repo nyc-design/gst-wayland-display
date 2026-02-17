@@ -52,6 +52,7 @@ pub struct Settings {
     render_node: Option<String>,
     input_devices: Vec<String>,
     disable_intel_workaround: bool,
+    multi_output: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -60,6 +61,8 @@ pub struct Settings {
 
 pub struct State {
     display: WaylandDisplay,
+    /// Wayland socket name, stored so we can unregister from the compositor registry on stop.
+    socket_name: Option<String>,
 }
 
 #[glib::object_subclass]
@@ -213,6 +216,13 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecBoolean::builder("multi-output")
+                    .nick("Multi-output mode")
+                    .blurb(
+                        "Enable multi-output mode: registers this compositor in a global registry so a secondary element can share it",
+                    )
+                    .default_value(false)
+                    .build(),
             ]
         });
 
@@ -276,6 +286,10 @@ impl ObjectImpl for WaylandDisplaySrc {
                 settings.disable_intel_workaround =
                     value.get::<bool>().expect("Type checked upstream");
             }
+            "multi-output" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.multi_output = value.get::<bool>().expect("Type checked upstream");
+            }
             _ => unreachable!(),
         }
     }
@@ -309,6 +323,10 @@ impl ObjectImpl for WaylandDisplaySrc {
             "disable-intel-workaround" => {
                 let settings = self.settings.lock().unwrap();
                 settings.disable_intel_workaround.to_value()
+            }
+            "multi-output" => {
+                let settings = self.settings.lock().unwrap();
+                settings.multi_output.to_value()
             }
             _ => unreachable!(),
         }
@@ -767,24 +785,51 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         }
 
         let mut structure = Structure::builder("wayland.src");
+        let mut wayland_socket_name = None;
         for (key, var) in display.env_vars().flat_map(|var| var.split_once("=")) {
             structure = structure.field(key, var);
+            if key == "WAYLAND_DISPLAY" {
+                wayland_socket_name = Some(var.to_string());
+            }
         }
         let structure = structure.build();
         if let Err(err) = elem.post_message(Application::builder(structure).src(&elem).build()) {
             gst::warning!(CAT, "Failed to post environment to gstreamer bus: {}", err);
         }
 
-        *state = Some(State { display });
+        // If multi-output mode is enabled, enable it on the compositor and
+        // register in the global registry so the secondary element can find us.
+        {
+            let settings = self.settings.lock().unwrap();
+            if settings.multi_output {
+                display.enable_multi_output();
+                if let Some(ref socket_name) = wayland_socket_name {
+                    waylanddisplaycore::register_compositor(socket_name, self.command_tx.clone());
+                    tracing::info!("Multi-output mode enabled, compositor registered as '{}'", socket_name);
+                } else {
+                    tracing::warn!("Multi-output enabled but no WAYLAND_DISPLAY found in env vars");
+                }
+            }
+        }
+
+        *state = Some(State { display, socket_name: wayland_socket_name });
 
         Ok(())
     }
 
     fn stop(&self) -> Result<(), gst::ErrorMessage> {
         let mut state = self.state.lock().unwrap();
-        if let Some(state) = state.take() {
+        if let Some(s) = state.take() {
+            // Unregister from global compositor registry if multi-output was enabled
+            if let Some(ref socket_name) = s.socket_name {
+                let settings = self.settings.lock().unwrap();
+                if settings.multi_output {
+                    waylanddisplaycore::unregister_compositor(socket_name);
+                    tracing::info!("Multi-output: unregistered compositor '{}'", socket_name);
+                }
+            }
             let subscriber = Registry::default().with(GstLayer);
-            tracing::subscriber::with_default(subscriber, || drop(state.display));
+            tracing::subscriber::with_default(subscriber, || drop(s.display));
         }
         Ok(())
     }

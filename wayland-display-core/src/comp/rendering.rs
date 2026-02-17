@@ -96,4 +96,52 @@ impl State {
             }
         }
     }
+
+    /// Render a frame from the secondary output (second window in multi-output mode).
+    /// This renders only the windows mapped to the secondary_space.
+    pub fn create_secondary_frame(
+        &mut self,
+    ) -> Result<(gst::Buffer, RenderOutputResult), OutputDamageTrackerError<GlesError>> {
+        assert!(self.secondary_output.is_some());
+        assert!(self.secondary_dtr.is_some());
+        assert!(self.secondary_video_info.is_some());
+        assert!(self.secondary_output_buffer.is_some());
+
+        // No cursor on secondary output (cursor stays on primary)
+        let elements: Vec<CursorElement<_>> = vec![];
+
+        let mut output_buffer = self
+            .secondary_output_buffer
+            .clone()
+            .expect("Secondary output buffer not set");
+
+        let mut target = output_buffer
+            .bind(&mut self.renderer)
+            .map_err(OutputDamageTrackerError::Rendering)?;
+
+        let render_output_result = render_output(
+            self.secondary_output.as_ref().unwrap(),
+            &mut self.renderer,
+            &mut target,
+            1.0,
+            0,
+            [&self.secondary_space],
+            &*elements,
+            self.secondary_dtr.as_mut().unwrap(),
+            [0.0, 0.0, 0.0, 1.0],
+        )?;
+
+        match self
+            .secondary_output_buffer
+            .clone()
+            .unwrap()
+            .to_gs_buffer(&mut target, &mut self.renderer)
+        {
+            Ok(buffer) => Ok((buffer, render_output_result)),
+            Err(e) => {
+                tracing::warn!("Failed to convert secondary buffer to gst buffer: {:?}", e);
+                Err(OutputDamageTrackerError::Rendering(GlesError::MappingError))
+            }
+        }
+    }
 }

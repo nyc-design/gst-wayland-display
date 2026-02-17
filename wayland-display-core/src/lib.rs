@@ -10,12 +10,41 @@ pub use smithay::backend::allocator::{
 };
 pub use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
+use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use utils::RenderTarget;
+
+// --- Multi-output compositor registry ---
+// Allows a secondary GStreamer element (waylanddisplaysecondary) to share the
+// same compositor thread as the primary waylanddisplaysrc, identified by the
+// Wayland socket name the compositor is listening on.
+
+static COMPOSITOR_REGISTRY: std::sync::LazyLock<Mutex<HashMap<String, Sender<Command>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Register a compositor's command sender under its Wayland socket name.
+pub fn register_compositor(socket_name: &str, sender: Sender<Command>) {
+    let mut registry = COMPOSITOR_REGISTRY.lock().unwrap();
+    registry.insert(socket_name.to_string(), sender);
+    tracing::info!("Registered compositor for socket: {}", socket_name);
+}
+
+/// Unregister a compositor when it shuts down.
+pub fn unregister_compositor(socket_name: &str) {
+    let mut registry = COMPOSITOR_REGISTRY.lock().unwrap();
+    registry.remove(socket_name);
+    tracing::info!("Unregistered compositor for socket: {}", socket_name);
+}
+
+/// Look up a compositor's command sender by Wayland socket name.
+pub fn lookup_compositor(socket_name: &str) -> Option<Sender<Command>> {
+    let registry = COMPOSITOR_REGISTRY.lock().unwrap();
+    registry.get(socket_name).cloned()
+}
 
 pub(crate) mod comp;
 #[cfg(test)]
@@ -47,6 +76,18 @@ pub enum Command {
     TouchCancel,
     TouchFrame,
     Quit,
+
+    // --- Multi-output extensions ---
+    /// Enable multi-output mode. The compositor will create a secondary output
+    /// and route the second toplevel window to it.
+    EnableMultiOutput,
+    /// Set video info for the secondary output (resolution, format).
+    SecondaryVideoInfo(GstVideoInfo),
+    /// Request a frame from the secondary output.
+    SecondaryBuffer(
+        SyncSender<Result<gst::Buffer, SwapBuffersError>>,
+        Option<Tracer>,
+    ),
 }
 
 #[derive(Clone)]
@@ -268,6 +309,42 @@ impl WaylandDisplay {
                 Err(gst::FlowError::Error)
             }
         }
+    }
+
+    /// Request a frame from the secondary output (second window).
+    pub fn frame_secondary(&self) -> Result<gst::Buffer, gst::FlowError> {
+        let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
+        if let Err(err) = self
+            .command_tx
+            .send(Command::SecondaryBuffer(buffer_tx, self.tracer.clone()))
+        {
+            tracing::warn!(?err, "Failed to send secondary buffer command.");
+            return Err(gst::FlowError::Eos);
+        }
+
+        match buffer_rx.recv() {
+            Ok(Ok(buffer)) => Ok(buffer),
+            Ok(Err(err)) => match err {
+                SwapBuffersError::AlreadySwapped => unreachable!(),
+                SwapBuffersError::ContextLost(_) => Err(gst::FlowError::Eos),
+                SwapBuffersError::TemporaryFailure(_) => Err(gst::FlowError::Error),
+            },
+            Err(err) => {
+                tracing::warn!(?err, "Failed to recv secondary buffer ack.");
+                Err(gst::FlowError::Error)
+            }
+        }
+    }
+
+    /// Enable multi-output mode. The compositor will create a secondary output
+    /// and route the second toplevel window to it.
+    pub fn enable_multi_output(&self) {
+        let _ = self.command_tx.send(Command::EnableMultiOutput);
+    }
+
+    /// Set video info for the secondary output.
+    pub fn set_secondary_video_info(&self, info: GstVideoInfo) {
+        let _ = self.command_tx.send(Command::SecondaryVideoInfo(info));
     }
 
     pub fn get_supported_dma_formats(&self) -> FormatSet {

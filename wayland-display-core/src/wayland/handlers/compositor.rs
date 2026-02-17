@@ -43,6 +43,14 @@ impl CompositorHandler for State {
         {
             window.on_commit();
         }
+        // Also check secondary space for multi-output mode
+        if let Some(window) = self
+            .secondary_space
+            .elements()
+            .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
+        {
+            window.on_commit();
+        }
         self.popups.commit(surface);
 
         // send the initial configure if relevant
@@ -73,20 +81,28 @@ impl CompositorHandler for State {
             }
 
             if !initial_configure_sent {
+                // Determine which output to use for sizing this toplevel.
+                // In multi-output mode, the 2nd+ toplevel goes to the secondary output.
+                let use_secondary = self.multi_output_enabled
+                    && self.toplevel_count >= 1
+                    && self.secondary_output.is_some();
+
+                let target_output = if use_secondary {
+                    self.secondary_output.as_ref().unwrap()
+                } else {
+                    self.output.as_ref().unwrap()
+                };
+
                 if max_size.w == 0 && max_size.h == 0 {
                     toplevel.with_pending_state(|state| {
                         state.size = Some(
-                            self.output
-                                .as_ref()
-                                .unwrap()
+                            target_output
                                 .current_mode()
                                 .unwrap()
                                 .size
                                 .to_f64()
                                 .to_logical(
-                                    self.output
-                                        .as_ref()
-                                        .unwrap()
+                                    target_output
                                         .current_scale()
                                         .fractional_scale(),
                                 )
@@ -101,8 +117,28 @@ impl CompositorHandler for State {
                 toplevel.send_configure();
                 self.pending_windows.push(window);
             } else {
+                // Determine which space to map into.
+                // In multi-output mode, the 2nd+ toplevel goes to secondary_space.
+                let use_secondary = self.multi_output_enabled
+                    && self.toplevel_count >= 1
+                    && self.secondary_output.is_some();
+
                 let loc = (0, 0);
-                self.space.map_element(window.clone(), loc, true);
+                if use_secondary {
+                    tracing::info!(
+                        "Mapping toplevel #{} to secondary space",
+                        self.toplevel_count
+                    );
+                    self.secondary_space.map_element(window.clone(), loc, true);
+                } else {
+                    tracing::info!(
+                        "Mapping toplevel #{} to primary space",
+                        self.toplevel_count
+                    );
+                    self.space.map_element(window.clone(), loc, true);
+                }
+                self.toplevel_count += 1;
+
                 self.seat.get_keyboard().unwrap().set_focus(
                     self,
                     Some(FocusTarget::from(window)),
